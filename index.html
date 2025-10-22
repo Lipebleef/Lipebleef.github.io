@@ -1,0 +1,1070 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Gerenciador de Custos — Cloud (Dark + Galaxy)</title>
+
+    <!-- Tailwind -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: { surface: "#0f172a", card: "#0b1220" }
+          }
+        }
+      }
+    </script>
+
+    <!-- Recharts (gráficos) -->
+    <script src="https://unpkg.com/recharts/umd/Recharts.min.js"></script>
+
+    <!-- Firebase (v9 modular via CDN) -->
+    <script type="module">
+      import { initializeApp } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-app.js";
+      import { getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-auth.js";
+      import {
+        getFirestore, collection, addDoc, onSnapshot, query, where, orderBy, getDocs,
+        serverTimestamp, Timestamp, doc, deleteDoc, updateDoc, setDoc, getDoc
+      } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore.js";
+
+      // Aguarda config.js (injetará window.firebaseConfig)
+      const waitForConfig = () => new Promise((resolve, reject) => {
+        const startedAt = performance.now();
+        const check = () => {
+          if (window.firebaseConfig) return resolve(window.firebaseConfig);
+          if (performance.now() - startedAt > 5000) {
+            return reject(new Error("config.js não encontrado. Edite o arquivo config.js com suas credenciais do Firebase."));
+          }
+          setTimeout(check, 50);
+        };
+        check();
+      });
+
+      const fmtBRL = (n) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(n ?? 0);
+      const toNumberFromLocale = (s) => {
+        if (typeof s === "number") return s;
+        if (!s) return 0;
+        const cleaned = String(s).replace(/\s/g, "").replace(/\./g, "").replace(/,/g, ".");
+        const n = Number(cleaned);
+        return isNaN(n) ? 0 : n;
+      };
+      const getMonthRange = (yyyyMM) => {
+        const [y, m] = yyyyMM.split("-").map(Number);
+        const start = new Date(y, m - 1, 1, 0, 0, 0, 0);
+        const end = new Date(y, m, 0, 23, 59, 59, 999);
+        return { start, end };
+      };
+      const daysInMonth = (y, m) => new Date(y, m, 0).getDate();
+      const getNextMonthStr = (yyyyMM) => {
+        const [y, m] = yyyyMM.split("-").map(Number);
+        const d = new Date(y, m - 1, 1);
+        d.setMonth(d.getMonth() + 1);
+        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
+      };
+      const labelMonthPt = (yyyyMM) => {
+        const [y, m] = yyyyMM.split("-").map(Number);
+        const d = new Date(y, m - 1, 1);
+        return d.toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
+      };
+
+
+      // UI helpers
+      const $ = (sel) => document.querySelector(sel);
+      const show = (el) => el.classList.remove("hidden");
+      const hide = (el) => el.classList.add("hidden");
+
+      const state = {
+        user: null,
+        entries: [],
+        unsub: null,
+        income: { salaryBase: 0, extraIncome: 0 },
+        savings: { savings: 0, investments: 0 },
+        nextEntries: [],
+        selectedMonth: (() => {
+          const t = new Date();
+          return `${t.getFullYear()}-${String(t.getMonth()+1).padStart(2, "0")}`;
+        })()
+      };
+
+      const renderAuth = () => {
+        if (state.user) {
+          $("#userName").textContent = state.user.displayName || state.user.email;
+          show($("#app"));
+          hide($("#login"));
+        } else {
+          hide($("#app"));
+          show($("#login"));
+        }
+      };
+
+      
+      function renderNextMonth() {
+        const tbody = document.getElementById("tbodyNext");
+        const totalEl = document.getElementById("nextMonthTotal");
+        const countEl = document.getElementById("nextMonthCount");
+        const autoEl = document.getElementById("nextMonthAutoCount");
+        const labelEl = document.getElementById("nextMonthLabel");
+        if (!tbody || !totalEl || !countEl || !autoEl || !labelEl) return;
+        tbody.innerHTML = "";
+        const total = state.nextEntries.reduce((s, e) => s + (Number(e.amount)||0), 0);
+        const autoCount = state.nextEntries.filter(e => e.autoCreated).length;
+        if (state.nextEntries.length === 0) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = '<td class="p-3 text-center text-slate-400" colspan="4">Sem lançamentos previstos.</td>';
+          tbody.appendChild(tr);
+        } else {
+          state.nextEntries
+            .slice()
+            .sort((a,b) => (a.date?.toDate?.()||new Date(a.date)) - (b.date?.toDate?.()||new Date(b.date)))
+            .forEach(e => {
+              const tr = document.createElement("tr");
+              tr.className = "border-t border-slate-700";
+              const d = e.date instanceof Timestamp ? e.date.toDate() : new Date(e.date);
+              tr.innerHTML = `
+                <td class="p-2">${d.toLocaleDateString("pt-BR")}</td>
+                <td class="p-2">${e.description || ""}</td>
+                <td class="p-2">${e.category || ""}</td>
+                <td class="p-2">${fmtBRL(e.amount || 0)}</td>
+              `;
+              tbody.appendChild(tr);
+            });
+        }
+        totalEl.textContent = fmtBRL(total);
+        countEl.textContent = String(state.nextEntries.length);
+        autoEl.textContent = String(autoCount);
+        const nextStr = getNextMonthStr(state.selectedMonth);
+        labelEl.textContent = labelMonthPt(nextStr);
+      }
+
+      const renderTableAndStats = () => {
+        const tbody = $("#tbody");
+        tbody.innerHTML = "";
+        if (state.entries.length === 0) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td colspan="5" class="p-4 text-center text-slate-400">Sem lançamentos neste mês.</td>`;
+          tbody.appendChild(tr);
+        } else {
+          for (const e of state.entries) {
+            const tr = document.createElement("tr");
+            tr.className = "border-t border-slate-700";
+            const d = e.date instanceof Timestamp ? e.date.toDate() : new Date(e.date);
+            tr.innerHTML = `
+              <td class="p-2">${d.toLocaleDateString("pt-BR")}</td>
+              <td class="p-2">${e.description || ""}</td>
+              <td class="p-2">${e.category || ""}</td>
+              <td class="p-2">${fmtBRL(e.amount || 0)}</td>
+              <td class="p-2">
+                <div class="flex items-center gap-2 justify-end">
+                  <button data-id="${e.__id}" class="btn-edit px-2 py-1 rounded-xl border border-slate-600 bg-slate-800 hover:shadow-sm">Editar</button>
+                  <button data-id="${e.__id}" class="btn-del px-2 py-1 rounded-xl border border-slate-600 bg-slate-800 hover:shadow-sm text-rose-400">Excluir</button>
+                </div>
+              </td>
+            `;
+            tbody.appendChild(tr);
+          }
+        }
+
+        // Totais
+        const totals = state.entries.reduce((acc, e) => {
+          const v = Number(e.amount) || 0;
+          acc.total += v;
+          acc.byCategory[e.category || "Geral"] = (acc.byCategory[e.category || "Geral"] || 0) + v;
+          return acc;
+        }, { total: 0, byCategory: {} });
+
+        const [y, m] = state.selectedMonth.split("-").map(Number);
+        const avg = totals.total / daysInMonth(y, m);
+
+        $("#totalMes").textContent = fmtBRL(totals.total);
+        $("#mediaDia").textContent = fmtBRL(avg);
+        $("#countMes").textContent = String(state.entries.length);
+
+        const topCat = Object.entries(totals.byCategory).sort((a,b) => b[1]-a[1])[0];
+        if (topCat) {
+          $("#catTop").textContent = topCat[0];
+          $("#catTopVal").textContent = `${fmtBRL(topCat[1])} (${((topCat[1]/(totals.total||1))*100).toFixed(1)}%)`;
+        } else {
+          $("#catTop").textContent = "—";
+          $("#catTopVal").textContent = "Sem dados";
+        }
+
+        // Cards de ganhos/gastos/saldo e poupança+investimentos
+        const ganhos = (Number(state.income?.salaryBase)||0) + (Number(state.income?.extraIncome)||0);
+        const gastos = totals.total;
+        const saldo  = ganhos - gastos;
+        const poupInv = (Number(state.savings?.savings)||0) + (Number(state.savings?.investments)||0);
+
+        $("#ganhosMes").textContent = fmtBRL(ganhos);
+        $("#gastosMes").textContent = fmtBRL(gastos);
+        setMoney(document.getElementById("saldoMes"), saldo);
+        $("#poupInvMes").textContent = fmtBRL(poupInv);
+        const tdDisp = document.getElementById("totalDisponivel");
+        const tdGasto = document.getElementById("gastosAcumulados");
+        if (tdDisp) setMoney(tdDisp, saldo);
+        if (tdGasto) tdGasto.textContent = fmtBRL(gastos);
+      };
+
+      // Carregar React/ReactDOM (Recharts depende de React)
+      const loadReact = async () => {
+        const add = (src) => new Promise((res, rej) => {
+          const s = document.createElement("script");
+          s.src = src; s.crossOrigin = "anonymous";
+          s.onload = res; s.onerror = rej;
+          document.head.appendChild(s);
+        });
+        await add("https://unpkg.com/react@18/umd/react.production.min.js");
+        await add("https://unpkg.com/react-dom@18/umd/react-dom.production.min.js");
+      };
+
+      const bootstrap = async () => {
+        try {
+          await loadReact();
+          const config = await waitForConfig();
+          const app = initializeApp(config);
+          const auth = getAuth(app);
+
+          // Safe binder (avoids null addEventListener errors)
+          function on(el, ev, fn) {
+            if (!el) { console.warn("Elemento não encontrado para bind:", ev); return; }
+            el.addEventListener(ev, fn);
+          }
+
+          const db = getFirestore(app);
+
+          // UI binds
+          on($("#btnLogin"), "click", async () => {
+            try {
+              await signInWithPopup(auth, new GoogleAuthProvider());
+            } catch (e) {
+              alert("Falha ao autenticar: " + (e.code || e.message));
+            }
+          });
+          on($("#btnLogout"), "click", async () => {
+            await signOut(auth);
+          });
+
+          $("#monthPicker").value = state.selectedMonth;
+
+          // Diagnóstico rápido de elementos críticos
+          ["btnLogin","btnLogout","monthPicker","isInstallment","formIncome","formSavings","formAdd","tabResumo","tabStats"].forEach(id => {
+            const el = document.getElementById(id);
+            if (!el) console.warn("[diagnóstico] id ausente no HTML:", id);
+          });
+
+
+        // ---- UI helpers for negative/positive formatting ----
+        function setMoney(el, value) {
+          if (!el) return;
+          el.textContent = fmtBRL(value);
+          el.classList.toggle("text-rose-400", value < 0);
+          el.classList.toggle("text-white", value >= 0);
+        }
+
+        // Tabs behavior
+        const tabResumoBtn = document.getElementById("tabResumo");
+        const tabStatsBtn = document.getElementById("tabStats");
+        const tabResumoPane = document.getElementById("tabResumoPane");
+        const tabStatsPane = document.getElementById("tabStatsPane");
+
+        function activateResumo(){
+          tabResumoBtn.classList.add("bg-indigo-600","text-white");
+          tabResumoBtn.classList.remove("bg-slate-800","border","border-slate-600","text-slate-100");
+          tabStatsBtn.classList.add("bg-slate-800","border","border-slate-600","text-slate-100");
+          tabStatsBtn.classList.remove("bg-indigo-600","text-white");
+          tabResumoPane.classList.remove("hidden");
+          tabStatsPane.classList.add("hidden");
+        }
+        function activateStats(){
+          tabStatsBtn.classList.add("bg-indigo-600","text-white");
+          tabStatsBtn.classList.remove("bg-slate-800","border","border-slate-600","text-slate-100");
+          tabResumoBtn.classList.add("bg-slate-800","border","border-slate-600","text-slate-100");
+          tabResumoBtn.classList.remove("bg-indigo-600","text-white");
+          tabResumoPane.classList.add("hidden");
+          tabStatsPane.classList.remove("hidden");
+          // Render charts when entering stats tab (ensures container is visible)
+          if (window.renderCharts) window.renderCharts();
+        }
+        on(tabResumoBtn, "click", activateResumo);
+        on(tabStatsBtn, "click", activateStats);
+        // default
+        activateResumo();
+
+          on($("#monthPicker"), "change", (e) => {
+            state.selectedMonth = e.target.value;
+            subscribeMonth();
+          });
+
+          // Toggle parcelas
+          on($("#isInstallment"), "change", (e) => {
+            $("#installmentsCount").disabled = !e.target.checked;
+          });
+
+          // Salvar receitas
+          on($("#formIncome"), "submit", async (e) => {
+            e.preventDefault();
+            if (!state.user) return alert("Entre com sua conta Google primeiro.");
+            const ref = doc(db, "users", state.user.uid, "incomes", state.selectedMonth);
+            await setDoc(ref, {
+              salaryBase: toNumberFromLocale($("#incomeBase").value),
+              extraIncome: toNumberFromLocale($("#incomeExtra").value),
+              updatedAt: serverTimestamp(),
+            }, { merge: true });
+            alert("Receitas salvas!");
+            subscribeMonth(); // recarrega cards
+          });
+
+          // Salvar poupança & investimentos
+          on($("#formSavings"), "submit", async (e) => {
+            e.preventDefault();
+            if (!state.user) return alert("Entre com sua conta Google primeiro.");
+            const ref = doc(db, "users", state.user.uid, "savings", state.selectedMonth);
+            await setDoc(ref, {
+              savings: toNumberFromLocale($("#saveAmount").value),
+              investments: toNumberFromLocale($("#investAmount").value),
+              updatedAt: serverTimestamp(),
+            }, { merge: true });
+            alert("Poupança/Investimentos salvos!");
+            subscribeMonth();
+          });
+
+          // Adicionar/parcelar despesas
+          on($("#formAdd"), "submit", async (e) => {
+            e.preventDefault();
+            if (!state.user) return alert("Entre com sua conta Google primeiro.");
+            const date = $("#fDate").value;
+            const description = $("#fDesc").value.trim() || "(sem descrição)";
+            const category = $("#fCat").value.trim() || "Geral";
+            const amount = toNumberFromLocale($("#fAmount").value);
+            const isInst = $("#isInstallment").checked;
+            const count = Math.max(2, Number($("#installmentsCount").value || 2));
+            const col = collection(db, "users", state.user.uid, "entries");
+
+            if (!isInst) {
+              await addDoc(col, {
+                date: Timestamp.fromDate(new Date(date)),
+                description, category, amount, createdAt: serverTimestamp(),
+              });
+            } else {
+              const perInstallment = amount; // valor informado considerado por parcela
+              const parentId = (crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now());
+              const start = new Date(date);
+              for (let i = 0; i < count; i++) {
+                const d = new Date(start.getFullYear(), start.getMonth() + i, start.getDate());
+                await addDoc(col, {
+                  date: Timestamp.fromDate(d),
+                  description: `${description} (${i+1}/${count})`,
+                  category,
+                  amount: perInstallment,
+                  createdAt: serverTimestamp(),
+                  installmentIndex: i+1,
+                  installmentTotal: count,
+                  parentId,
+                  autoCreated: true,
+                });
+              }
+            }
+
+            e.target.reset();
+            $("#fDate").value = new Date().toISOString().slice(0,10);
+            $("#fCat").value = "Geral";
+            $("#isInstallment").checked = false;
+            $("#installmentsCount").disabled = true;
+          });
+
+          const subscribeMonth = async () => {
+            if (!state.user) return;
+            if (state.unsub) { state.unsub(); state.unsub = null; }
+
+            // Carrega receitas e savings do mês
+            const incomeRef = doc(db, "users", state.user.uid, "incomes", state.selectedMonth);
+            const savingsRef = doc(db, "users", state.user.uid, "savings", state.selectedMonth);
+            const [incSnap, savSnap] = await Promise.all([getDoc(incomeRef), getDoc(savingsRef)]);
+            state.income = incSnap.exists() ? incSnap.data() : { salaryBase: 0, extraIncome: 0 };
+            state.savings = savSnap.exists() ? savSnap.data() : { savings: 0, investments: 0 };
+
+            // Assina despesas do mês
+            const { start, end } = getMonthRange(state.selectedMonth);
+            const col = collection(db, "users", state.user.uid, "entries");
+            const q = query(col,
+              where("date", ">=", Timestamp.fromDate(start)),
+              where("date", "<=", Timestamp.fromDate(end)),
+              orderBy("date", "desc")
+            );
+            state.unsub = onSnapshot(q, (snap) => {
+              state.entries = snap.docs.map(d => ({ __id: d.id, ...d.data() }));
+              renderTableAndStats();
+              renderCharts();
+            });
+
+            // --- Próximo mês (fetch único) ---
+            try {
+              const nextStr = getNextMonthStr(state.selectedMonth);
+              const { start: ns, end: ne } = getMonthRange(nextStr);
+              const qn = query(col,
+                where("date", ">=", Timestamp.fromDate(ns)),
+                where("date", "<=", Timestamp.fromDate(ne)),
+                orderBy("date", "asc")
+              );
+              const nextSnap = await getDocs(qn);
+              state.nextEntries = nextSnap.docs.map(d => ({ __id: d.id, ...d.data() }));
+              renderNextMonth();
+            } catch (err) { /* silencioso */ }
+
+          };
+
+          onAuthStateChanged(auth, (user) => {
+            state.user = user || null;
+            renderAuth();
+            if (user) subscribeMonth();
+          });
+
+          // Charts via React components (Recharts usa React)
+          function renderCharts() {
+            const { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, PieChart, Pie, Cell, Legend, CartesianGrid } = window.Recharts;
+            const rootBar = document.getElementById("chartBar");
+            const rootPie = document.getElementById("chartPie");
+            const React = window.React, ReactDOM = window.ReactDOM;
+
+            const [y, m] = state.selectedMonth.split("-").map(Number);
+            const dim = daysInMonth(y, m);
+            const perDay = Array.from({length: dim}, (_, i) => ({ day: String(i+1).padStart(2, "0"), value: 0 }));
+            const totals = {};
+            for (const e of state.entries) {
+              const d = (e.date instanceof Timestamp ? e.date.toDate() : new Date(e.date)).getDate();
+              perDay[d-1].value += Number(e.amount) || 0;
+              const c = e.category || "Geral";
+              totals[c] = (totals[c] || 0) + (Number(e.amount) || 0);
+            }
+            const catData = Object.entries(totals).map(([name, value]) => ({ name, value }));
+
+            function BarComp() {
+              return React.createElement('div', { style: { width: "100%", height: "256px" } },
+                React.createElement(ResponsiveContainer, { width: "100%", height: "100%" },
+                  React.createElement(BarChart, { data: perDay },
+                    React.createElement(CartesianGrid, { strokeDasharray: "3 3" }),
+                    React.createElement(XAxis, { dataKey: "day", stroke: "#cbd5e1" }),
+                    React.createElement(YAxis, { stroke: "#cbd5e1" }),
+                    React.createElement(Tooltip, null),
+                    React.createElement(Bar, { dataKey: "value", radius: [6,6,0,0] })
+                  )
+                )
+              );
+            }
+            function PieComp() {
+              return React.createElement('div', { style: { width: "100%", height: "256px" } },
+                React.createElement(ResponsiveContainer, { width: "100%", height: "100%" },
+                  React.createElement(PieChart, null,
+                    React.createElement(Pie, { dataKey: "value", data: catData, nameKey: "name", cx: "50%", cy: "50%", outerRadius: 90, label: true },
+                      catData.map((_, i) => React.createElement(Cell, { key: i }))
+                    ),
+                    React.createElement(Legend, null),
+                    React.createElement(Tooltip, null)
+                  )
+                )
+              );
+            }
+
+            ReactDOM.render(React.createElement(BarComp), rootBar);
+            ReactDOM.render(React.createElement(PieComp), rootPie);
+          }
+
+          // Exponha para re-render inicial após auth
+          window.renderCharts = renderCharts;
+          window.renderTableAndStats = renderTableAndStats;
+
+        } catch (e) {
+          const box = document.getElementById('errors');
+          box.textContent = "Falha ao iniciar app: " + (e.stack || e.message);
+          box.classList.remove("hidden");
+        }
+      };
+
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => bootstrap());
+      } else {
+        bootstrap();
+      }
+    </script>
+
+    <!-- Arquivo com as credenciais do Firebase (o usuário deve editar) -->
+    <script src="config.js"></script>
+
+    <style>
+      body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+      .btn-primary {
+        @apply px-4 py-2 rounded-2xl text-white shadow hover:shadow-md;
+        background: linear-gradient(135deg, #4f46e5, #7c3aed);
+      }
+      .btn-secondary {
+        @apply px-3 py-2 rounded-2xl bg-slate-800 border border-slate-600 text-slate-100 shadow hover:shadow-md;
+      }
+      input, select {
+        background-color: #0b1220;
+        color: #e5e7eb;
+        border-color: #334155;
+      }
+      table th { color: #94a3b8; }
+      /* Galaxy canvas visual layering */
+      .galaxy-card { position: relative; overflow: hidden; }
+      .galaxy-canvas { position:absolute; inset:0; width:100%; height:100%; display:block; filter: saturate(1.2) brightness(0.9); }
+      .galaxy-overlay { position: relative; z-index: 1; }
+    </style>
+  </head>
+
+  <body class="min-h-screen bg-surface text-slate-100">
+    <div id="errors" class="hidden m-4 p-3 rounded-xl bg-rose-900/60 text-rose-100 border border-rose-500/60"></div>
+
+    <!-- Tela de login com GALÁXIA -->
+    <div id="login" class="max-w-xl mx-auto p-0 mt-10 rounded-2xl shadow galaxy-card bg-card">
+      <canvas id="galaxy" class="galaxy-canvas"></canvas>
+      <div class="galaxy-overlay p-6">
+        <h1 class="text-2xl font-bold">Gerenciador de Custos — Cloud</h1>
+        <p class="text-slate-300 mt-2">Entre com sua conta Google para salvar seus dados na nuvem (Firestore).</p>
+        <button id="btnLogin" class="btn-primary mt-6">Entrar com Google</button>
+        <p class="text-xs text-slate-300 mt-4">Seus dados ficam associados à sua conta Google.</p>
+      </div>
+    </div>
+
+    <!-- App principal -->
+    <div id="app" class="hidden max-w-6xl mx-auto p-4 md:p-8">
+      <div class="flex items-center justify-between">
+        <div>
+          <h1 class="text-2xl md:text-3xl font-bold tracking-tight">Gerenciador de Custos — Cloud</h1>
+          <div class="text-slate-400">Conectado como <span id="userName" class="font-medium text-slate-100"></span></div>
+        </div>
+        <button id="btnLogout" class="btn-secondary">Sair</button>
+      </div>
+
+      <!-- Controles superiores -->
+      <div class="mt-6 grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div class="flex items-center gap-3">
+          <label class="text-sm text-slate-400">Mês</label>
+          <input id="monthPicker" type="month" class="rounded-xl border p-2 shadow-sm focus:outline-none focus:ring w-40" />
+        </div>
+        <div class="text-sm text-slate-400 self-center">Dados sincronizados com Firestore (tempo real).</div>
+      </div>
+
+      <!-- Cards de resumo -->
+      <div class="mt-6 grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div class="bg-card rounded-2xl p-4 shadow">
+          <div class="text-sm text-slate-400">Ganhos do mês</div>
+          <div id="ganhosMes" class="text-2xl font-semibold text-white">R$ 0,00</div>
+        </div>
+        <div class="bg-card rounded-2xl p-4 shadow">
+          <div class="text-sm text-slate-400">Gastos do mês</div>
+          <div id="gastosMes" class="text-2xl font-semibold text-white">R$ 0,00</div>
+        </div>
+        <div class="bg-card rounded-2xl p-4 shadow">
+          <div class="text-sm text-slate-400">Saldo</div>
+          <div id="saldoMes" class="text-2xl font-semibold text-white">R$ 0,00</div>
+        </div>
+        <div class="bg-card rounded-2xl p-4 shadow">
+          <div class="text-sm text-slate-400">Poupado + Investido</div>
+          <div id="poupInvMes" class="text-2xl font-semibold text-white">R$ 0,00</div>
+        </div>
+      
+      <!-- Resumo Financeiro (tabela dinâmica) -->
+      <div class="mt-6 bg-card rounded-2xl p-4 shadow">
+        <div class="font-medium mb-3">Resumo financeiro do mês</div>
+        <div class="overflow-auto">
+          <table class="min-w-full text-sm">
+            <thead>
+              <tr class="text-left text-slate-400">
+                <th class="p-2">Indicador</th>
+                <th class="p-2">Valor</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="border-t border-slate-700">
+                <td class="p-2">Disponível no mês (Ganhos − Gastos)</td>
+                <td class="p-2 font-medium" id="totalDisponivel">R$ 0,00</td>
+              </tr>
+              <tr class="border-t border-slate-700">
+                <td class="p-2">Gastos acumulados</td>
+                <td class="p-2 font-medium" id="gastosAcumulados">R$ 0,00</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+</div>
+
+      <!-- Receitas do mês -->
+      <div class="mt-6 bg-card rounded-2xl p-4 shadow">
+        <div class="font-medium mb-3">Receitas do mês</div>
+        <form id="formIncome" class="grid grid-cols-1 md:grid-cols-4 gap-3">
+          <div>
+            <label class="text-sm text-slate-400">Salário base</label>
+            <div class="relative">
+              <span class="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-400">R$</span>
+              <input id="incomeBase" type="text" inputmode="decimal" class="w-full rounded-xl border p-2 shadow-sm pl-8" placeholder="0,00">
+            </div>
+          </div>
+          <div>
+            <label class="text-sm text-slate-400">Renda extra</label>
+            <div class="relative">
+              <span class="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-400">R$</span>
+              <input id="incomeExtra" type="text" inputmode="decimal" class="w-full rounded-xl border p-2 shadow-sm pl-8" placeholder="0,00">
+            </div>
+          </div>
+          <div class="md:col-span-2 flex items-end justify-end">
+            <button class="btn-primary">Salvar receitas</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Poupança & Investimentos -->
+      <div class="mt-6 bg-card rounded-2xl p-4 shadow">
+        <div class="font-medium mb-3">Poupança & Investimentos</div>
+        <form id="formSavings" class="grid grid-cols-1 md:grid-cols-4 gap-3">
+          <div>
+            <label class="text-sm text-slate-400">Poupança</label>
+            <div class="relative">
+              <span class="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-400">R$</span>
+              <input id="saveAmount" type="text" inputmode="decimal" class="w-full rounded-xl border p-2 shadow-sm pl-8" placeholder="0,00">
+            </div>
+          </div>
+          <div>
+            <label class="text-sm text-slate-400">Investimentos</label>
+            <div class="relative">
+              <span class="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-400">R$</span>
+              <input id="investAmount" type="text" inputmode="decimal" class="w-full rounded-xl border p-2 shadow-sm pl-8" placeholder="0,00">
+            </div>
+          </div>
+          <div class="md:col-span-2 flex items-end justify-end">
+            <button class="btn-secondary">Salvar</button>
+          </div>
+        </form>
+      </div>
+
+      <div id="tabStatsPane" class="hidden">
+      <!-- Gráficos -->
+      <div class="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div class="bg-card rounded-2xl p-4 shadow">
+          <div class="mb-2 font-medium">Gastos por dia</div>
+          <div id="chartBar"></div>
+        </div>
+        <div class="bg-card rounded-2xl p-4 shadow">
+          <div class="mb-2 font-medium">Gastos por categoria</div>
+          <div id="chartPie"></div>
+        </div>
+      </div>
+
+      </div>
+      <!-- Formulário -->
+      <div class="mt-8 bg-card rounded-2xl p-4 shadow">
+        <form id="formAdd" class="grid grid-cols-1 md:grid-cols-7 gap-3">
+          <div>
+            <label class="text-sm text-slate-400">Data</label>
+            <input id="fDate" type="date" class="w-full rounded-xl border p-2 shadow-sm" required />
+          </div>
+          <div class="md:col-span-2">
+            <label class="text-sm text-slate-400">Descrição</label>
+            <input id="fDesc" type="text" class="w-full rounded-xl border p-2 shadow-sm" placeholder="Ex.: Mercado, Uber, Almoço..." />
+          </div>
+          <div>
+            <label class="text-sm text-slate-400">Categoria</label>
+            <input id="fCat" type="text" class="w-full rounded-xl border p-2 shadow-sm" placeholder="Ex.: Mercado" />
+          </div>
+          <div>
+            <label class="text-sm text-slate-400">Valor (R$)</label>
+            <div class="relative">
+              <span class="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-400">R$</span>
+              <input id="fAmount" type="text" inputmode="decimal" class="w-full rounded-xl border p-2 shadow-sm pl-8" placeholder="0,00" required />
+            </div>
+          </div>
+          <div class="md:col-span-2 flex items-center gap-3">
+            <label class="flex items-center gap-2">
+              <input id="isInstallment" type="checkbox" class="rounded">
+              <span>Compra parcelada</span>
+            </label>
+            <input id="installmentsCount" type="number" min="2" value="2"
+                   class="w-28 rounded-xl border p-2 shadow-sm"
+                   placeholder="Parcelas" disabled>
+          </div>
+
+          <div class="md:col-span-7 flex items-center gap-2 justify-end">
+            <button id="btnAdd" type="submit" class="btn-primary">Adicionar</button>
+            <button id="btnSave" type="button" class="hidden btn-secondary">Salvar</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Tabela -->
+      <div class="mt-6 bg-card rounded-2xl p-4 shadow">
+        <div class="flex items-center justify-between mb-2">
+          <div class="font-medium">Lançamentos do mês</div>
+        </div>
+        <div class="overflow-auto">
+          <table class="min-w-full text-sm">
+            <thead>
+              <tr class="text-left text-slate-400">
+                <th class="p-2">Data</th>
+                <th class="p-2">Descrição</th>
+                <th class="p-2">Categoria</th>
+                <th class="p-2">Valor</th>
+                <th class="p-2 text-right">Ações</th>
+              </tr>
+            </thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="mt-6 text-xs text-slate-400">
+        <ul class="list-disc ml-5 space-y-1">
+          <li>Dados salvos no Firestore (Google Cloud) vinculados à sua conta.</li>
+          <li>Acesse de qualquer dispositivo: basta fazer login com a mesma conta.</li>
+        </ul>
+      </div>
+
+      <footer class="mt-10 text-center text-slate-500 text-sm">
+        © 2025 <span class="font-medium text-white">By Lipe</span> — Todos os direitos reservados.
+      </footer>
+    </div>
+
+    <!-- Script do CANVAS Galáxia -->
+    <script>
+      (function(){
+        const canvas = document.getElementById('galaxy');
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        let w, h, stars = [], nebulas = [];
+        const DPR = Math.max(1, window.devicePixelRatio || 1);
+
+        const rand = (min, max) => Math.random() * (max - min) + min;
+        function resize() {
+          // usa o tamanho do card
+          const card = canvas.parentElement.getBoundingClientRect();
+          w = Math.max(320, Math.floor(card.width));
+          h = Math.max(200, Math.floor(card.height));
+          canvas.width = Math.floor(w * DPR);
+          canvas.height = Math.floor(h * DPR);
+          canvas.style.width = w + 'px';
+          canvas.style.height = h + 'px';
+          ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+          init();
+        }
+
+        function init() {
+          stars = [];
+          const count = Math.floor((w * h) / 3500); // densidade proporcional
+          for (let i = 0; i < count; i++) {
+            stars.push({
+              x: rand(0, w),
+              y: rand(0, h),
+              r: rand(0.3, 1.6),
+              a: rand(0.5, 1),
+              tw: rand(0.002, 0.01),
+              vx: rand(-0.03, 0.03),
+              vy: rand(-0.03, 0.03)
+            });
+          }
+
+          nebulas = [];
+          const nebCount = 2;
+          for (let i = 0; i < nebCount; i++) {
+            nebulas.push({
+              x: rand(w*0.2, w*0.8),
+              y: rand(h*0.2, h*0.8),
+              r: rand(Math.min(w,h)*0.35, Math.min(w,h)*0.55),
+              hue: rand(200, 280), // azul-violeta
+              alpha: rand(0.06, 0.12),
+              drift: rand(0.02, 0.05)
+            });
+          }
+        }
+
+        function drawBackground() {
+          const grd = ctx.createRadialGradient(w*0.5, h*0.6, Math.min(w,h)*0.1, w*0.5, h*0.6, Math.max(w,h)*0.8);
+          grd.addColorStop(0, '#0b1220');
+          grd.addColorStop(1, '#05080f');
+          ctx.fillStyle = grd;
+          ctx.fillRect(0, 0, w, h);
+        }
+
+        function drawNebulas(t) {
+          nebulas.forEach((n, i) => {
+            const r = n.r * (1 + Math.sin((t*0.001 + i) * n.drift) * 0.02);
+            const grad = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, r);
+            const c1 = `hsla(${n.hue}, 90%, 65%, ${n.alpha})`;
+            const c2 = `hsla(${n.hue+30}, 90%, 55%, ${n.alpha*0.6})`;
+            grad.addColorStop(0, c1);
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.globalCompositeOperation = 'screen';
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.arc(n.x, n.y, r, 0, Math.PI*2);
+            ctx.fill();
+            ctx.globalCompositeOperation = 'lighter';
+          });
+          ctx.globalCompositeOperation = 'source-over';
+        }
+
+        function drawStars(t) {
+          ctx.save();
+          ctx.fillStyle = '#fff';
+          stars.forEach((s, i) => {
+            const tw = (Math.sin(t * s.tw + i) + 1) * 0.5; // 0..1
+            const a = s.a * (0.5 + tw * 0.5);
+            ctx.globalAlpha = a;
+            ctx.beginPath();
+            ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
+            ctx.fill();
+
+            // movimento suave
+            s.x += s.vx;
+            s.y += s.vy;
+            if (s.x < -2) s.x = w + 2;
+            if (s.x > w + 2) s.x = -2;
+            if (s.y < -2) s.y = h + 2;
+            if (s.y > h + 2) s.y = -2;
+          });
+          ctx.restore();
+        }
+
+        function loop(t) {
+          drawBackground();
+          drawNebulas(t);
+          drawStars(t);
+          requestAnimationFrame(loop);
+        }
+
+        // start
+        window.addEventListener('resize', resize);
+        // observar mudanças de tamanho do card (quando mensagens aparecem)
+        const ro = new ResizeObserver(resize);
+        ro.observe(canvas.parentElement);
+        resize();
+        requestAnimationFrame(loop);
+      })();
+    </script>
+
+    <script>
+      // Inicializa valores do formulário após carregar DOM
+      document.addEventListener("DOMContentLoaded", () => {
+        const today = new Date().toISOString().slice(0,10);
+        const fDate = document.getElementById("fDate");
+        if (fDate) fDate.value = today;
+        const fCat = document.getElementById("fCat");
+        if (fCat) fCat.value = "Geral";
+      });
+    </script>
+  </body>
+</html>      <div id="tabResumoPane">
+      </div>
+      <!-- Gráficos -->
+      <div class="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div class="bg-card rounded-2xl p-4 shadow">
+          <div class="mb-2 font-medium">Gastos por dia</div>
+          <div id="chartBar"></div>
+        </div>
+        <div class="bg-card rounded-2xl p-4 shadow">
+          <div class="mb-2 font-medium">Gastos por categoria</div>
+          <div id="chartPie"></div>
+        </div>
+      </div>
+
+      <!-- Formulário -->
+      <div class="mt-8 bg-card rounded-2xl p-4 shadow">
+        <form id="formAdd" class="grid grid-cols-1 md:grid-cols-7 gap-3">
+          <div>
+            <label class="text-sm text-slate-400">Data</label>
+            <input id="fDate" type="date" class="w-full rounded-xl border p-2 shadow-sm" required />
+          </div>
+          <div class="md:col-span-2">
+            <label class="text-sm text-slate-400">Descrição</label>
+            <input id="fDesc" type="text" class="w-full rounded-xl border p-2 shadow-sm" placeholder="Ex.: Mercado, Uber, Almoço..." />
+          </div>
+          <div>
+            <label class="text-sm text-slate-400">Categoria</label>
+            <input id="fCat" type="text" class="w-full rounded-xl border p-2 shadow-sm" placeholder="Ex.: Mercado" />
+          </div>
+          <div>
+            <label class="text-sm text-slate-400">Valor (R$)</label>
+            <div class="relative">
+              <span class="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-400">R$</span>
+              <input id="fAmount" type="text" inputmode="decimal" class="w-full rounded-xl border p-2 shadow-sm pl-8" placeholder="0,00" required />
+            </div>
+          </div>
+          <div class="md:col-span-2 flex items-center gap-3">
+            <label class="flex items-center gap-2">
+              <input id="isInstallment" type="checkbox" class="rounded">
+              <span>Compra parcelada</span>
+            </label>
+            <input id="installmentsCount" type="number" min="2" value="2"
+                   class="w-28 rounded-xl border p-2 shadow-sm"
+                   placeholder="Parcelas" disabled>
+          </div>
+
+          <div class="md:col-span-7 flex items-center gap-2 justify-end">
+            <button id="btnAdd" type="submit" class="btn-primary">Adicionar</button>
+            <button id="btnSave" type="button" class="hidden btn-secondary">Salvar</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Tabela -->
+      <div class="mt-6 bg-card rounded-2xl p-4 shadow">
+        <div class="flex items-center justify-between mb-2">
+          <div class="font-medium">Lançamentos do mês</div>
+        </div>
+        <div class="overflow-auto">
+          <table class="min-w-full text-sm">
+            <thead>
+              <tr class="text-left text-slate-400">
+                <th class="p-2">Data</th>
+                <th class="p-2">Descrição</th>
+                <th class="p-2">Categoria</th>
+                <th class="p-2">Valor</th>
+                <th class="p-2 text-right">Ações</th>
+              </tr>
+            </thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="mt-6 text-xs text-slate-400">
+        <ul class="list-disc ml-5 space-y-1">
+          <li>Dados salvos no Firestore (Google Cloud) vinculados à sua conta.</li>
+          <li>Acesse de qualquer dispositivo: basta fazer login com a mesma conta.</li>
+        </ul>
+      </div>
+
+      <footer class="mt-10 text-center text-slate-500 text-sm">
+        © 2025 <span class="font-medium text-white">By Lipe</span> — Todos os direitos reservados.
+      </footer>
+    </div>
+
+    <!-- Script do CANVAS Galáxia -->
+    <script>
+      (function(){
+        const canvas = document.getElementById('galaxy');
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        let w, h, stars = [], nebulas = [];
+        const DPR = Math.max(1, window.devicePixelRatio || 1);
+
+        const rand = (min, max) => Math.random() * (max - min) + min;
+        function resize() {
+          // usa o tamanho do card
+          const card = canvas.parentElement.getBoundingClientRect();
+          w = Math.max(320, Math.floor(card.width));
+          h = Math.max(200, Math.floor(card.height));
+          canvas.width = Math.floor(w * DPR);
+          canvas.height = Math.floor(h * DPR);
+          canvas.style.width = w + 'px';
+          canvas.style.height = h + 'px';
+          ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+          init();
+        }
+
+        function init() {
+          stars = [];
+          const count = Math.floor((w * h) / 3500); // densidade proporcional
+          for (let i = 0; i < count; i++) {
+            stars.push({
+              x: rand(0, w),
+              y: rand(0, h),
+              r: rand(0.3, 1.6),
+              a: rand(0.5, 1),
+              tw: rand(0.002, 0.01),
+              vx: rand(-0.03, 0.03),
+              vy: rand(-0.03, 0.03)
+            });
+          }
+
+          nebulas = [];
+          const nebCount = 2;
+          for (let i = 0; i < nebCount; i++) {
+            nebulas.push({
+              x: rand(w*0.2, w*0.8),
+              y: rand(h*0.2, h*0.8),
+              r: rand(Math.min(w,h)*0.35, Math.min(w,h)*0.55),
+              hue: rand(200, 280), // azul-violeta
+              alpha: rand(0.06, 0.12),
+              drift: rand(0.02, 0.05)
+            });
+          }
+        }
+
+        function drawBackground() {
+          const grd = ctx.createRadialGradient(w*0.5, h*0.6, Math.min(w,h)*0.1, w*0.5, h*0.6, Math.max(w,h)*0.8);
+          grd.addColorStop(0, '#0b1220');
+          grd.addColorStop(1, '#05080f');
+          ctx.fillStyle = grd;
+          ctx.fillRect(0, 0, w, h);
+        }
+
+        function drawNebulas(t) {
+          nebulas.forEach((n, i) => {
+            const r = n.r * (1 + Math.sin((t*0.001 + i) * n.drift) * 0.02);
+            const grad = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, r);
+            const c1 = `hsla(${n.hue}, 90%, 65%, ${n.alpha})`;
+            const c2 = `hsla(${n.hue+30}, 90%, 55%, ${n.alpha*0.6})`;
+            grad.addColorStop(0, c1);
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.globalCompositeOperation = 'screen';
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.arc(n.x, n.y, r, 0, Math.PI*2);
+            ctx.fill();
+            ctx.globalCompositeOperation = 'lighter';
+          });
+          ctx.globalCompositeOperation = 'source-over';
+        }
+
+        function drawStars(t) {
+          ctx.save();
+          ctx.fillStyle = '#fff';
+          stars.forEach((s, i) => {
+            const tw = (Math.sin(t * s.tw + i) + 1) * 0.5; // 0..1
+            const a = s.a * (0.5 + tw * 0.5);
+            ctx.globalAlpha = a;
+            ctx.beginPath();
+            ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
+            ctx.fill();
+
+            // movimento suave
+            s.x += s.vx;
+            s.y += s.vy;
+            if (s.x < -2) s.x = w + 2;
+            if (s.x > w + 2) s.x = -2;
+            if (s.y < -2) s.y = h + 2;
+            if (s.y > h + 2) s.y = -2;
+          });
+          ctx.restore();
+        }
+
+        function loop(t) {
+          drawBackground();
+          drawNebulas(t);
+          drawStars(t);
+          requestAnimationFrame(loop);
+        }
+
+        // start
+        window.addEventListener('resize', resize);
+        // observar mudanças de tamanho do card (quando mensagens aparecem)
+        const ro = new ResizeObserver(resize);
+        ro.observe(canvas.parentElement);
+        resize();
+        requestAnimationFrame(loop);
+      })();
+    </script>
+
+    <script>
+      // Inicializa valores do formulário após carregar DOM
+      document.addEventListener("DOMContentLoaded", () => {
+        const today = new Date().toISOString().slice(0,10);
+        const fDate = document.getElementById("fDate");
+        if (fDate) fDate.value = today;
+        const fCat = document.getElementById("fCat");
+        if (fCat) fCat.value = "Geral";
+      });
+    </script>
+  </body>
+</html>
